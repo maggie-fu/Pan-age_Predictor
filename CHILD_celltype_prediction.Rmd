@@ -1,0 +1,1440 @@
+---
+title: "CHILD_celltype_prediction"
+author: "Maggie Fu"
+date: '2022-10-28'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+setwd("/mnt/scratch/KoborLab/Personal_Folders/mfu/Projects/MRP")
+library(rlang)
+library(vctrs)
+library(matrixStats)
+library(ggplot2)
+library(dplyr)
+library(glmnet)
+library(caret)
+library(genefilter)
+library(MASS)
+library(bumphunter)
+library(methylumi)
+library(minfi)
+library(plyr)
+# library(wateRmelon)
+library(pvclust)
+library(pheatmap)
+library(parallel)
+# library(SIS)
+library(GGally)
+library(limma)
+# Plotting
+library(Metrics)
+library(nord)
+library(caret)
+library(FlowSorted.Blood.450k)
+library(FlowSorted.Blood.EPIC)
+library(FlowSorted.CordBlood.450k)
+# library(FlowSorted.BloodExtended.EPIC)
+library(ExperimentHub)
+
+# .libPaths(c("/mnt/scratch/KoborLab/R_Libs/4.2", .libPaths()))
+# paths <- .libPaths()
+library(PCAtools)
+
+# Self-defined functions
+printVar = function(x,y){
+      pearson = cor.test(x, y, method = "pearson")[c("estimate", "p.value")]
+      spearman = cor.test(x, y, method = "spearman")[c("estimate", "p.value")]
+      # fit <- lm(y ~ x)
+      # R2 <- summary(fit)$r.squared[1]*100
+      # rmse <- sqrt(sum(fit$residuals^2) / fit$df)
+      # vals_fit = c(R2, rmse)
+      vals <- c(pearson[1], spearman[1])
+      names(vals) = c("r", "rho")
+      paste(names(vals), signif(unlist(vals), 3), collapse = "; ")
+}
+my_fn <- function(data, mapping, ...){
+  # takes in x and y for each panel
+  xData <- eval_data_col(data, mapping$x)
+  yData <- eval_data_col(data, mapping$y)
+  colorData <- eval_data_col(data, mapping$colour)
+
+# if you have colors, split according to color group and calculate cor
+  byGroup = by(data.frame(xData,yData), colorData, function(i) printVar(i[,1], i[,2]))
+  byGroup = data.frame(col = names(byGroup), label = as.character(byGroup))
+  byGroup$x = 0.5
+
+# main correlation
+  mainCor = printVar(xData,yData)
+  p <- ggplot(data = data, mapping = mapping) +
+      annotate(x = 0.5, y = 0.8, label = mainCor, geom = "text", size = 3.5) +
+      geom_text(data = byGroup, inherit.aes = FALSE,
+                aes(x = x, y = y, col = col, label = label), size = 3.5) +
+      theme_minimal() + ylim(c(0,1))
+  p
+}
+```
+
+```{r}
+hub <- ExperimentHub()
+query(hub, "FlowSorted.BloodExtended.EPIC")  
+
+### Extended reference
+FlowSorted.BloodExtended.EPIC <- hub[["EH5425"]]
+pData(FlowSorted.BloodExtended.EPIC)$SampType <- "PB"
+# FlowSorted.BloodExtended.EPIC.FN <- preprocessFunnorm(FlowSorted.BloodExtended.EPIC)
+# save(FlowSorted.BloodExtended.EPIC.FN, file = "reference/FlowSorted.BloodExtended.EPIC_FN.RData")
+# load("reference/FlowSorted.BloodExtended.EPIC_FN.RData")
+# table(pData(FlowSorted.BloodExtended.EPIC.FN)$CellType)
+# table(pData(FlowSorted.BloodExtended.EPIC.FN)$include)
+FlowSorted.BloodExtended.EPIC.FN <- readRDS("/mnt/scratch/KoborLab/Multi_cohort_projects/EpiAge_CellTypes/bzhuang/Celltype_est_from_matrix_test/referenceMset_fnorm_noob.rds")
+pData(FlowSorted.BloodExtended.EPIC.FN)$SampType <- "PB"
+# test_set <- FlowSorted.BloodExtended.EPIC.FN[, pData(FlowSorted.BloodExtended.EPIC.FN)$CellType == "MIX"]
+# FlowSorted.BloodExtended.EPIC.FN <- FlowSorted.BloodExtended.EPIC.FN[, pData(FlowSorted.BloodExtended.EPIC.FN)$include %in% "Yes"]
+
+### IDOL reference
+FlowSorted.Blood.EPIC <- libraryDataGet('FlowSorted.Blood.EPIC')
+pData(FlowSorted.Blood.EPIC)$SampType <- "PB"
+pData(FlowSorted.Blood.EPIC)$CellType <- pData(FlowSorted.Blood.EPIC)$CellType %>%
+    gsub("Neu", "Gran", .)
+# FlowSorted.Blood.EPIC.FN <- preprocessFunnorm(FlowSorted.Blood.EPIC)
+# save(FlowSorted.Blood.EPIC.FN, file = "reference/FlowSorted.Blood.EPIC_FN.RData")
+load("reference/FlowSorted.Blood.EPIC_FN.RData")
+table(pData(FlowSorted.Blood.EPIC)$CellType)
+
+### Reinus reference
+data(FlowSorted.Blood.450k)
+pData(FlowSorted.Blood.450k)$SampType <- "PB"
+FlowSorted.Blood.450k.FN <- preprocessFunnorm(FlowSorted.Blood.450k)
+# save(FlowSorted.Blood.450k.FN, file = "reference/FlowSorted.Blood.450k_FN.RData")
+load("reference/FlowSorted.Blood.450k_FN.RData")
+table(pData(FlowSorted.Blood.450k.FN)$CellType)
+
+### Cord reference
+FlowSorted.CordBlood.450k <- libraryDataGet('FlowSorted.CordBloodCombined.450k')
+pData(FlowSorted.CordBlood.450k)$SampType <- "CB"
+pData(FlowSorted.CordBlood.450k)$CellType <- pData(FlowSorted.CordBlood.450k)$CellType %>%
+    gsub("WholeBlood", "WB", .)
+# FlowSorted.CordBlood.450k.FN <- preprocessFunnorm(FlowSorted.CordBlood.450k)
+
+### MRP reference
+load("reference/Mixed_Reference_RGset.RData")
+pData(referenceRGset)$CellType <- pData(referenceRGset)$CellType %>%
+    gsub("WBC", "WB", .)
+# referenceRGset.FN <- preprocessFunnorm(referenceRGset)
+# save(referenceRGset.FN, file = "Mixed_Reference_FN.RData")
+load("reference/Mixed_Reference_FN.RData")
+
+load("reference/403-New_BloodCell_reference.RData")
+pData(BloodCell.S)$Cell_Type[pData(BloodCell.S)$Cell_Type == "Neutrophils"] <- "Granulocytes"
+pData(BloodCell.S)$Cell_Subtype[pData(BloodCell.S)$Cell_Subtype == "Neutrophil"] <- "Neutrophils"
+table(pData(BloodCell.S)$Cell_Subtype, pData(BloodCell.S)$Cell_Type)
+BloodCell <- BloodCell.S[, is.na(pData(BloodCell.S)$Cell_Subtype)]
+table(pData(BloodCell)$Cell_Type)
+```
+
+### Separate samples into cord, age 1, and age 5
+
+```{r}
+# CHILD_final <- readRDS("~/CHILD/Data/DNAm_Array/CHILD_Final.rds")
+# meta <- pData(CHILD_final)
+# rownames(meta) <- meta$Chip_Position
+# meta_0 <- meta[meta$Sample_Type == "Cord", ]
+# meta_1 <- meta[meta$Sample_Type == "OneYear", ]
+# meta_5 <- meta[meta$Sample_Type == "FiveYears", ]
+# save(meta_0, meta_1, meta_5, file = "CHILD_meta_split_by_age.RData")
+
+load("data/CHILD_meta_split_by_age.RData")
+
+### RGset
+CHILD <- readRDS("/mnt/scratch/KoborLab/CHILD/Data/DNAm_Array/Misc_Preprocessing/Original_ExtendedRGset_Raw_All_Samples.rds")
+# CHILD.fn <- preprocessFunnorm(CHILD)
+# save(CHILD.fn, file = "CHILD_funnorm.RData")
+dataset <- CHILD.fn[, rownames(meta_5)]
+
+### Betas
+load("data/CHILD_funnorm.RData")
+dataset <- getBeta(CHILD.fn)[, rownames(meta_5)]
+
+### Unique to age 1 samples
+meta_1only <- meta_1[!meta_1$SubjectNumber %in% meta_5$SubjectNumber, ]
+dataset <- getBeta(CHILD.fn)[, rownames(meta_1only)] # betas
+dataset <- CHILD[, rownames(meta_1only)] # RGset
+```
+
+### GSE77797 and GSE112618
+
+```{r}
+load("data/GSE77797.RData")
+GSE77797.FN <- preprocessFunnorm(GSE77797)
+dataset <- getBeta(GSE77797.FN)
+
+load("data/GSE112618.RData")
+GSE112618.FN <- preprocessFunnorm(GSE112618)
+dataset <- getBeta(GSE112618.FN)
+
+```
+
+### Setup Parallelization
+
+```{r}
+.libPaths()
+# .libPaths("/mnt/scratch/KoborLab/R/x86_64-pc-linux-gnu-library/4.2")
+library(doParallel)
+cl <- makeCluster(10)
+registerDoParallel(cl)
+clusterEvalQ(cl, library(doParallel))
+# stopCluster(cl)
+# .libPaths(c("/mnt/scratch/KoborLab/R/x86_64-pc-linux-gnu-library/4.2", .libPaths()))
+```
+
+
+### Setup
+
+```{r}
+if (verbose)
+    cat("Loading Reference Dataset.\n")
+# load("RData/03-BloodCell_reference.RData")
+#load("403-New_BloodCell_reference.RData")
+source("../../Functions/MRP_accessory.R")
+source("~/Personal_Folders/mfu/Functions/pickCompProbesCaret.R")
+
+sampType = rep("PB", ncol(dataset)) # c("PB", "CB")
+class = "betas" # c("rgset", "betas")
+norm = "QN.b" # c("Noob", "FN", "QN", "QN.b", "none")
+normComb = TRUE
+probeList = "IDOL" #c("Ttest", "Caret", "IDOL", "DHS")
+method = "CP" #c("CP", "RPC", "SVR")
+probeSelect = "both" #c("both", "any", "pval")
+conditions = NULL
+nProbes = 100
+verbose = TRUE
+plotRef = FALSE
+removenRBC = T
+EPIConly = F
+seed = 1
+reference = FlowSorted.BloodExtended.EPIC.FN # c(FlowSorted.CordBlood.450k.FN, FlowSorted.Blood.450k.FN, FlowSorted.Blood.EPIC.FN, FlowSorted.BloodExtended.EPIC.FN)
+# reference data NEEDS to be a mlset / rgset / grset and have SampType and CellType columns in pData
+reference = referenceRGset.FN # c(BloodCell, referenceRGset.FN)
+cellTypes = c("CD8T", "CD4T", "NK", "Bcell", "Mono", "Gran") #, "nRBC"
+cellTypes = c("Bas", "Bmem", "Bnv", "CD4mem", "CD4nv",
+              "CD8mem", "CD8nv", "Eos", "Mono", "Neu", "NK", "Treg")
+caretMods = c("EL", "BLR", "CART", "RF", "GBM") # c("EL", "BLR", "CART", "RF", "GBM", "RFEnLDA", "RFEnRF", "RFEnNB", "RFEnSVM", "RFEnNN")
+
+require(dplyr)
+require(limma)
+require(genefilter)
+#require(FlowSorted.Blood.450k)
+require(FlowSorted.Blood.EPIC)
+#require(FlowSorted.CordBloodCombined.450k)
+require(IlluminaHumanMethylation450kmanifest)
+require(IlluminaHumanMethylationEPICmanifest)
+#require(ExperimentHub)
+#require(EpiDISH)
+#hub <- ExperimentHub()
+library(SIS)
+```
+
+#### Combine data / normalize
+```{r}
+if (verbose)
+    cat("Starting Cell Type Estimation.\n")
+# if (removenRBC == T) {
+#     cellTypes <- c("CD8T", "CD4T", "NK", "Bcell", "Mono", "Gran")
+# } else {
+#     cellTypes <- c("CD8T", "CD4T", "NK", "Bcell", "Mono", "Gran", "nRBC")
+# }
+if (norm == "FN") {
+    processMethod <- "preprocessFunnorm"
+    if (class == "betas") stop("A RGChannelSet is required for functional normalization")
+} else if (norm == "Noob") {
+    processMethod <- "preprocessNoob"
+    if (class == "betas") stop("A RGChannelSet or is required for Noob normalization")
+} else if (norm == "QN") {
+    processMethod <- "preprocessQuantile"
+    if (class == "betas") stop("A RGChannelSet is required for this quantile normalization method. If you only have betas, set normalization method to QN.b instead")
+} else if (norm == "QN.b") {
+    processMethod <- "normalizeQuantiles"
+    if (class == "rgset") stop("QN.b is exclusively for beta matrix input. Use QN instead if you have an RGChannelSet")
+}
+sampCT <- rep("WBC", ncol(dataset))
+if (norm != "none") {
+    processMethod <- get(processMethod)
+}
+
+### Data normalization
+if (verbose) 
+    cat("Combining Data with Flow Sorted Data and Normalizing.\n")
+if (class == "betas") {
+    # if (all(sampType %in% "CB")) {
+    #     ref <- betas(reference[pData(reference)$SampType == "CB", ])
+    # } else {
+    #     ref <- betas(reference)
+    # }
+    if (class(reference) == "MethyLumiSet"){
+        ref <- betas(reference)
+    } else if (class(reference) %in% c("RGChannelSetExtended", "RGChannelSet", "GenomicRatioSet")){
+        ref <- getBeta(reference)
+    }
+    commonprobe <- intersect(as.character(rownames(dataset)), as.character(rownames(ref)))
+    if (norm == "QN.b") { 
+        comb <- cbind(dataset[commonprobe, ], ref[commonprobe, ])
+        comb.n <- processMethod(comb) 
+        samp.n <- comb.n[, colnames(dataset)]
+        ref.n <- comb.n[, colnames(ref)]
+    } else if (norm == "none") {
+        samp.n <- dataset[commonprobe, ]
+        ref.n <- ref[commonprobe, ]
+    }
+} else {
+    dataset <- as(dataset, "RGChannelSet")
+    if (norm == "none") {
+        commonprobe <- intersect(as.character(rownames(dataset)), as.character(rownames(reference)))
+        samp.n <- betas(reference)[commonprobe, ]
+        ref.n <- getBeta(dataset)[commonprobe, ]
+        
+    } else if (normComb) { # Combine all the datasets and normalize
+        combRGset <- combineArrays(dataset, reference, outType = "IlluminaHumanMethylation450k")
+        combRGset.N <- processMethod(combRGset)
+        comb.n <- getBeta(combRGset.N)
+        samp.n <- comb.n[, colnames(dataset)]
+        ref.n <- comb.n[, colnames(reference)]
+    } 
+    
+}
+
+combMeta <- data.frame(sampleNames = c(colnames(samp.n), colnames(ref.n)),
+                       studyIndex = rep(c("user", "reference"), times = c(ncol(samp.n), ncol(ref.n))),
+                       sampleType = c(sampType, as.character(pData(reference)$SampType)),
+                       cellType = c(sampCT, as.character(pData(reference)$CellType)), 
+                       stringsAsFactors = FALSE)
+refMeta <- combMeta[combMeta$studyIndex == "reference", ]
+sampMeta <- combMeta[combMeta$studyIndex == "user", ]
+
+# save(ref.n, samp.n, combMeta, file = "MRPref_CHILD_FN_0.RData")
+# save(ref.n, samp.n, combMeta, file = "MRPref_CHILD_FN_1.RData")
+# save(ref.n, samp.n, combMeta, file = "MRPref_CHILD_FN_5.RData")
+```
+
+#### Pick probes
+
+```{r}
+### Pick probes and estimate weights
+if (verbose)
+    cat("Estimating Weights for Cell Type Prediction Based on Selected Probeset.\n")
+if (probeList == "Ttest") {
+    coefs <- pickCompProbes2(betas = ref.n, 
+                             meta = refMeta, 
+                             nP = nProbes,
+                             ct = cellTypes, 
+                             ps = probeSelect, 
+                             p.val = 0.05, 
+                             min.delta.beta = 0, 
+                             plot = plotRef) # Call the pickCompProbes2 function below to select the probes that can best discern cell types and calculate weights
+} else if (probeList == "Caret") {
+    coefs_caret <- pickCompProbesCaret(betas = ref.n, 
+                                       meta = refMeta, 
+                                       ct = cellTypes, 
+                                       caretMods = caretMods, # caretMods = c("EL", "BLR", "CART", "RF", "GBM", "LDA", "RFEnRF", "RFEnNB", "RFEnSVM", "RFEnNN")
+                                       verbose = verbose, 
+                                       filtern = 10000,
+                                       seed = seed)
+} else {
+    load("/mnt/scratch/KoborLab/Personal_Folders/mfu/Reference/Probe_libraries.RData")
+    if (probeList == "IDOL") {
+        if (unique(sampType) == "CB") {
+            pLib <- idol.c
+        } else if (nrow(samp.n) > 622399) {
+            if ("CD8nv" %in% cellTypes) {
+                pLib <- idol.a_ext
+            } else {
+                pLib <- idol.a_EPIC
+            }
+        } else {
+            pLib <- idol.a_450
+        }
+    } else if (probeList == "DHS") {
+        pLib <- DHS
+    }
+    coefs <- pickCompProbes2(betas = ref.n, meta = refMeta, nP = nProbes, 
+                             ct = cellTypes, trainingProbes = pLib, plot = plotRef) 
+}
+
+```
+
+### Estimate proportion
+
+```{r}
+### Estimate cell type proportion
+if (verbose)
+    cat("Estimating Composition Based on Selected Projection Method.\n")
+projectionMethod <- get(method)
+
+if (probeList == "Caret"){
+    out <- lapply(coefs_caret$probeCoefs, function(coefs){
+        mat <- samp.n[rownames(coefs), ]
+        mat <- as.matrix(mat[complete.cases(mat), ])
+        mat.cb <- mat[, sampMeta$sampleType == "CB"]
+        mat.pb <- mat[, sampMeta$sampleType == "PB"]
+        coefs.cb <- as.matrix(coefs)
+        coefs.pb <- coefs.cb[, colnames(coefs.cb) != "nRBC"] # For peripheral blood, remove nRBC in prediction
+        if (ncol(mat.cb) > 0) {
+            if (is.null(conditions)) counts.cb <- projectionMethod(samp.n = mat.cb, coef = coefs.cb) %>% 
+                    as.data.frame()# Using the weights generated in the last step to stimate the proportion of each cell type
+            else counts.cb <- projectionMethod(samp.n = mat.cb, coef = coefs.cb, conditions = conditions) %>% 
+                    as.data.frame()
+        } 
+        if (ncol(mat.pb) > 0) {
+            if (is.null(conditions)) counts.pb <- projectionMethod(samp.n = mat.pb, coef = coefs.pb) %>% 
+                    as.data.frame()
+            else counts.pb <- projectionMethod(samp.n = mat.pb, coef = coefs.pb, conditions = conditions) %>% 
+                    as.data.frame()
+            counts.pb$nRBC <- 0
+        }
+        if (exists("counts.cb") & exists("counts.pb")) {
+            counts <- rbind(counts.cb, counts.pb) %>% .[colnames(mat), ]
+        } else if (exists("counts.cb") & !exists("counts.pb")) {
+            counts <- counts.cb
+        } else if (!exists("counts.cb") & exists("counts.pb")) {
+            counts <- counts.pb
+        }
+        return(counts)
+    })
+} else {
+    mat <- samp.n[rownames(coefs), ]
+    mat <- as.matrix(mat[complete.cases(mat), ])
+    mat.cb <- mat[, sampMeta$sampleType == "CB"]
+    mat.pb <- mat[, sampMeta$sampleType == "PB"]
+    coefs.cb <- as.matrix(coefs)
+    coefs.pb <- coefs.cb[, colnames(coefs.cb) != "nRBC"]
+    if (ncol(mat.cb) > 0) {
+        if (is.null(conditions)) counts.cb <- projectionMethod(samp.n = mat.cb, coef = coefs.cb) %>% 
+                as.data.frame() 
+        else counts.cb <- projectionMethod(samp.n = mat.cb, coef = coefs.cb, conditions = conditions) %>% 
+                as.data.frame()
+    } 
+    if (ncol(mat.pb) > 0) {
+        if (is.null(conditions)) counts.pb <- projectionMethod(samp.n = mat.pb, coef = coefs.pb) %>% 
+                as.data.frame()
+        else counts.pb <- projectionMethod(samp.n = mat.pb, coef = coefs.pb, conditions = conditions) %>% 
+                as.data.frame()
+        counts.pb$nRBC <- 0
+    }
+    if (exists("counts.cb") & exists("counts.pb")) {
+        counts <- rbind(counts.cb, counts.pb) %>% .[colnames(mat), ]
+    } else if (exists("counts.cb") & !exists("counts.pb")) {
+        counts <- counts.cb
+    } else if (!exists("counts.cb") & exists("counts.pb")) {
+        counts <- counts.pb
+    }
+    out <- counts
+}
+
+# out <- list(counts = counts, coefs = coefs, betas.n = samp.n)
+```
+
+### Analyzing the picked probes
+
+```{r}
+coefs_caret$probeList$Bas$EL$coefs
+coefs_caret$probeList$Bas$tTestTop10000
+coefs_caret$probeCoefs
+
+#### Reporting function of probes
+probe_ttesttop_overlap <- probe_n <- matrix(NA, nrow = length(cellTypes), ncol = length(caretMods), dimnames = list(cellTypes, caretMods))
+
+probe_n <- lapply(coefs_caret$probeList, function(ct){
+    lapply(caretMods, function(mods){
+        return(length(ct[[mods]]$coefs)) # How many probes are selected?
+    })
+}) %>% 
+    unlist() %>% 
+    matrix(., nrow = length(caretMods), ncol = length(cellTypes), dimnames = list(caretMods, cellTypes))
+
+probe_ttesttop_overlap <- lapply(coefs_caret$probeList, function(ct){
+    lapply(caretMods, function(mods){
+        probes <- ct[[mods]]$coefs
+        overlap500 <- intersect(probes, ct$tTestTop10000[1:500]) %>% length()
+        overlap1000 <- intersect(probes, ct$tTestTop10000[1:1000]) %>% length()
+        overlap2000 <- intersect(probes, ct$tTestTop10000[1:2000]) %>% length()
+        overlap5000 <- intersect(probes, ct$tTestTop10000[1:5000]) %>% length()
+        overlap10000 <- intersect(probes, ct$tTestTop10000) %>% length()
+        return(c(overlap500, overlap1000, overlap2000, overlap5000, overlap10000)) 
+    }) # How many of the top ttest probes are picked?
+}) %>% 
+    unlist() %>% 
+    matrix(., nrow = length(caretMods)*5, 
+           ncol = length(cellTypes), 
+           dimnames = list(paste0(rep(caretMods, each = 5), c(500, 1000, 2000, 5000, 10000)), cellTypes))
+```
+
+
+### Tests
+
+```{r}
+### Normalization method - Age 5
+out.IDOLref.QN.5 <- out
+out.IDOLref.noN.5 <- out
+out.IDOLref.FN.5 <- out
+test1 <- list(FNtogether = out.IDOLref.FN.5, 
+              QN = out.IDOLref.QN.5, 
+              noNorm = out.IDOLref.noN.5)
+save(test1, file = "CHILD_tests/Test1.2_CHILD_normalization.RData")
+
+### Reference selection - Age 5
+out.Reinusref.QN.5 <- out
+out.IDOLref.QN.5 <- out
+out.MRPref.QN.5 <- out
+out.Extended.QN.5 <- out
+out.MRPExtended.QN.5 <- out
+out.MRPExtended_majorCT.QN.5 <- out
+test2 <- list(IDOL = out.IDOLref.QN.5, 
+              IDOLextended = out.Extended.QN.5, 
+              Reinus = out.Reinusref.QN.5,
+              MRP = out.MRPref.QN.5, 
+              MRPextended = out.MRPExtended.QN.5, 
+              MRPextended.limited = out.MRPExtended_majorCT.QN.5)
+test2 <- list(IDOL = out.IDOLref.QN.5, 
+              IDOLextended = out.Extended.QN.5, 
+              Reinus = out.Reinusref.QN.5,
+              MRP = out.MRPref.QN.5,
+              MRPextended = out.MRPExtended_majorCT.QN.5)
+save(test2, file = "CHILD_tests/Test2.2_CHILD_reference.RData")
+
+### Feature selection - Age 5
+out.Extended.QN.Ttest.5 <- out
+out.Extended.QN.IDOL.5 <- out
+out.Extended.QN.DHS.5 <- out
+out.Extended.QN.Caret_EL.5 <- out$EL
+out.Extended.QN.Caret_RF.5 <- out$RF
+out.Extended.QN.Caret_BLR.5 <- out$BLR
+out.Extended.QN.Caret_CART.5 <- out$CART
+out.Extended.QN.Caret_GBM.5 <- out$GBM
+out.Extended.QN.Caret_RFEnSVM.5 <- out$RFEnSVM
+out.Extended.QN.Caret_RFEnNB.5 <- out$RFEnNB
+out.Extended.QN.Caret_Combined.5 <- out$combined
+
+test3 <- list(Ttest = out.Extended.QN.Ttest.5, 
+              IDOL = out.Extended.QN.IDOL.5, 
+              DHS = out.Extended.QN.DHS.5, 
+              EL = out.Extended.QN.Caret_EL.5,
+              RF = out.Extended.QN.Caret_RF.5,
+              BLR = out.Extended.QN.Caret_BLR.5, 
+              CART = out.Extended.QN.Caret_CART.5, 
+              GBM = out.Extended.QN.Caret_GBM.5, 
+              RFEnNB = out.Extended.QN.Caret_RFEnNB.5, 
+              RFEnSVM = out.Extended.QN.Caret_RFEnSVM.5, 
+              Combined = out.Extended.QN.Caret_Combined.5)
+save(test3, coefs_caret, file = "CHILD_tests/Test3_CHILD_probeSelect.RData")
+save(test3, coefs_caret, file = "CHILD_tests/Test3.2_CHILD_probeSelect.RData")
+save(test3, coefs_caret, file = "CHILD_tests/Test3.2_CHILD_probeSelect_2.RData")
+save(test3, coefs_caret, file = "CHILD_tests/Test3.2_CHILD_probeSelect_3.RData")
+
+# Test probe picking but with MRP
+out.MRP.QN.Ttest.5 <- out
+out.MRP.QN.IDOL.5 <- out
+out.MRP.QN.DHS.5 <- out
+out.MRP.QN.Caret_EL.5 <- out$EL
+out.MRP.QN.Caret_RF.5 <- out$RF
+out.MRP.QN.Caret_BLR.5 <- out$BLR
+out.MRP.QN.Caret_CART.5 <- out$CART
+out.MRP.QN.Caret_GBM.5 <- out$GBM
+out.MRP.QN.Caret_RFEnSVM.5 <- out$RFEnSVM
+out.MRP.QN.Caret_RFEnNB.5 <- out$RFEnNB
+out.MRP.QN.Caret_Combined.5 <- out$combined
+
+test3.3 <- list(Ttest = out.MRP.QN.Ttest.5, 
+                IDOL = out.MRP.QN.IDOL.5,
+                DHS = out.MRP.QN.DHS.5,
+                EL = out.MRP.QN.Caret_EL.5,
+                RF = out.MRP.QN.Caret_RF.5,
+                BLR = out.MRP.QN.Caret_BLR.5,
+                CART = out.MRP.QN.Caret_CART.5,
+                GBM = out.MRP.QN.Caret_GBM.5,
+                RFEnNB = out.MRP.QN.Caret_RFEnNB.5,
+                RFEnSVM = out.MRP.QN.Caret_RFEnSVM.5,
+                Combined = out.MRP.QN.Caret_Combined.5)
+              
+save(test3.3, coefs_caret, file = "CHILD_tests/Test3.3_CHILD_probeSelect_1.RData")
+save(test3.3, coefs_caret, file = "CHILD_tests/Test3.3_CHILD_probeSelect_2.RData")
+save(test3.3, coefs_caret, file = "CHILD_tests/Test3.3_CHILD_probeSelect_3.RData")
+
+
+
+
+### Regression method - Age 5
+out.Extended.QN.Caret_RF_CP.5 <- out$RF
+out.Extended.QN.Caret_RF_SVR.5 <- out$RF
+out.Extended.QN.Caret_RF_RPC.5 <- out$RF
+test4 <- list(CP = out.Extended.QN.Caret_RF_CP.5, 
+              SVR = out.Extended.QN.Caret_RF_SVR.5, 
+              RPC = out.Extended.QN.Caret_RF_RPC.5)
+save(test4, file = "CHILD_tests/Test4_CHILD_regression.RData")
+save(test4, file = "CHILD_tests/Test4.2_CHILD_regression.RData")
+
+### Overall - MRP ref - Age 1
+out.minfi <- estimateCellCounts2(dataset, probeSelect = "auto", referencePlatform = "IlluminaHumanMethylationEPIC")
+out.minfi <- out.minfi$prop
+# out.idol <- estimateCellCounts2(dataset, probeSelect = "IDOL", referencePlatform = "IlluminaHumanMethylationEPIC")
+# out.idol <- out.idol$prop
+test5 <- list(MRPref.QN.Caret.RF.RPC = out.MRPref.QN.Caret_RF_RPC.5, 
+              estimateCellCounts = as.data.frame(out.minfi))
+save(test5, file = "Test5_CHILD_overall.RData")
+
+### Overall - MRP ref - Age 1
+out.MRPref.QN.Caret_RF_RPC.1 <- out
+out.minfi <- estimateCellCounts2(dataset, probeSelect = "auto", referencePlatform = "IlluminaHumanMethylationEPIC")
+out.minfi <- out.minfi$prop
+test6 <- list(MRPref.QN.Caret.RF.RPC = out.MRPref.QN.Caret_RF_RPC.1, 
+              estimateCellCounts = as.data.frame(out.minfi))
+save(test6, coefs_caret, file = "CHILD_tests/Test5_CHILD_overall_1.RData")
+
+### Overall - IDOL extended ref - Age 5
+out.IDOLexref.QN.Caret_RF_RPC.5 <- out
+coefs_caret_IDOL <- coefs_caret
+out.MRPref.QN.Caret_RF_RPC.5 <- out
+coefs_caret_MRP <- coefs_caret
+out.minfi <- estimateCellCounts2(dataset, probeSelect = "auto", referencePlatform = "IlluminaHumanMethylationEPIC")
+out.minfi <- ut.minfi$prop %>% as.data.frame()
+out.extended <- estimateCellCounts2(dataset, compositeCellType = "BloodExtended", probeSelect = "auto",
+                                    referencePlatform = "IlluminaHumanMethylationEPIC",
+                                    referenceset = "FlowSorted.BloodExtended.EPIC",
+                                    cellTypes = c("Bas", "Bmem", "Bnv", "CD4mem", "CD4nv", "CD8mem",
+                                                  "CD8nv", "Eos", "Mono", "Neu", "NK", "Treg"))
+out.extended <- out.extended$prop %>% as.data.frame()
+test7 <- list(IDOLextendedref.QN.Caret.RF.RPC = out.IDOLexref.QN.Caret_RF_RPC.5, 
+              MRPref.QN.Caret.RF.RPC = out.MRPref.QN.Caret_RF_RPC.5, 
+              estimateCellCounts = out.minfi, 
+              estimateCellCountsExtended = out.extended)
+save(test7, coefs_caret_IDOL, coefs_caret_MRP, file = "CHILD_tests/Test7_CHILD_overall_5_extended.RData")
+
+### Overall - IDOL extended ref - Age 1
+out.IDOLexref.QN.Caret_RF_RPC.1 <- out
+out.MRPref.QN.Caret_RF_RPC.1 <- out
+out.minfi <- estimateCellCounts2(dataset, probeSelect = "auto", referencePlatform = "IlluminaHumanMethylationEPIC")
+out.minfi <- out.minfi$prop %>% as.data.frame()
+out.extended <- estimateCellCounts2(dataset, compositeCellType = "BloodExtended", probeSelect = "auto",
+                                    referencePlatform = "IlluminaHumanMethylationEPIC",
+                                    referenceset = "FlowSorted.BloodExtended.EPIC",
+                                    cellTypes = c("Bmem", "Bnv", "CD4mem", "CD4nv", "CD8mem", "CD8nv", "Treg", 
+                                                  "NK", "Mono", "Bas", "Eos", "Neu"))
+out.extended <- out.extended$prop %>% as.data.frame()
+test8 <- list(MRPref.QN.Caret.RF.RPC = out.MRPref.QN.Caret_RF_RPC.1, 
+              IDOLextendedref.QN.Caret.RF.RPC = out.IDOLexref.QN.Caret_RF_RPC.1, 
+              estimateCellCounts = out.minfi, 
+              estimateCellCountsExtended = out.extended)
+save(test8, coefs_caret_IDOL, coefs_caret_MRP, file = "CHILD_tests/Test8_CHILD_overall_1_extended.RData")
+
+### Overall - IDOL extended ref - Age 0 cord
+out.MRPref.Noob.Caret_RF_RPC.0 <- out
+coefs_caret_Noob <- coefs_caret
+out.MRPref.FN.Caret_RF_RPC.0 <- out
+coefs_caret_FN <- coefs_caret
+out.MRPref.QN.Caret_RF_RPC.0 <- out
+out.MRPref.QN.Caret_EL_RPC.0 <- out
+coefs_caret_QN <- coefs_caret
+out.MRPref.NoN.Caret_RF_RPC.0 <- out
+coefs_caret_NoN <- coefs_caret
+out.minfi <- estimateCellCounts2(dataset, compositeCellType = "CordBloodCombined", probeSelect = "auto",
+                                 referenceset = "FlowSorted.CordBlood.450k",
+                                 cellTypes = c("CD8T", "CD4T", "NK","Bcell", "Mono", "Gran", "nRBC"))
+out.minfi <- out.minfi$prop %>% as.data.frame()
+test9 <- list(MRPref.QN.Caret.RF.RPC = out.MRPref.QN.Caret_RF_RPC.0, 
+              MRPref.QN.Caret.EL.RPC = out.MRPref.QN.Caret_EL_RPC.0,
+              MRPref.NoN.Caret.RF.RPC = out.MRPref.NoN.Caret_RF_RPC.0, 
+              MRPref.FN.Caret.RF.RPC = out.MRPref.FN.Caret_RF_RPC.0, 
+              MRPref.Noob.Caret.RF.RPC = out.MRPref.Noob.Caret_RF_RPC.0, 
+              estimateCellCountsCord = out.minfi)
+save(test9, coefs_caret_Noob, coefs_caret_FN, coefs_caret_QN, coefs_caret_NoN, 
+     file = "CHILD_tests/Test9_CHILD_overall_0_extended.RData")
+
+save(out.IDOLref.0, out.MRPref.0, 
+     out.IDOLref.1, out.MRPref.1, 
+     out.IDOLref.5, out.MRPref.5, 
+     file = "CHILD_refcompare_0_1_5.RData")
+
+### Overall - IDOL extended ref - Age 1 only
+out.Extended.QN.EL_CP.1 <- out$EL
+out.Extended.QN.RF_CP.1 <- out$RF
+out.Extended.QN.RFEnRF_CP.1 <- out$RFEnRF
+out.Extended.QN.RFEnNB_CP.1 <- out$RFEnNB
+out.minfi <- estimateCellCounts2(dataset, probeSelect = "auto", referencePlatform = "IlluminaHumanMethylationEPIC")
+out.minfi <- out.minfi$prop
+out.minfiext <- estimateCellCounts2(dataset, probeSelect = "auto",
+                                    compositeCellType = "BloodExtended",
+                                    processMethod = "preprocessNoob",
+                                    cellTypes = c("Bas", "Bmem", "Bnv", "CD4mem", "CD4nv", "CD8mem", 
+                                                  "CD8nv", "Eos", "Mono", "Neu", "NK", "Treg"))
+out.minfiext <- out.minfiext$prop %>% as.data.frame()
+test10 <- list(Extendedref.QN.EL.CP = out.Extended.QN.EL_CP.1,
+               Extendedref.QN.RF.CP = out.Extended.QN.RF_CP.1,
+               Extendedref.QN.RFEnRF.CP = out.Extended.QN.RFEnRF_CP.1,
+               Extendedref.QN.RFEnNB.CP = out.Extended.QN.RFEnNB_CP.1,
+               ECC2 = as.data.frame(out.minfi), 
+               ECC2.Extended = out.minfiext)
+save(test10, coefs_caret, file = "CHILD_tests/Test10_CHILD_overall_1.RData")
+
+
+# save(out.svr, out.cp, out.rpc, out.minfi, out.idol, file = "CHILD_ct_prediction.RData")
+```
+
+### N = 3, Test in age 5 CHILD cohort, QN.b normalized on FN samples.
+
+```{r}
+#n1
+MRP.n1_coef <- coefs_caret
+MRP.n1_out <- out
+save(MRP.n1_out, MRP.n1_coef, file = "CHILD_tests/Test11_n3_MRPn1.RData")
+#n2
+MRP.n2_coef <- coefs_caret
+MRP.n2_out <- out
+save(MRP.n2_out, MRP.n2_coef, file = "CHILD_tests/Test11_n3_MRPn2.RData")
+#n3
+MRP.n3_coef <- coefs_caret
+MRP.n3_out <- out
+save(MRP.n3_out, MRP.n3_coef, file = "CHILD_tests/Test11_n3_MRPn3.RData")
+#n4
+MRP.n4_coef <- coefs_caret
+MRP.n4_out <- out
+save(MRP.n4_out, MRP.n4_coef, file = "CHILD_tests/Test11_n3_MRPn4.RData")
+#n5
+MRP.n5_coef <- coefs_caret
+MRP.n5_out <- out
+save(MRP.n5_out, MRP.n5_coef, file = "CHILD_tests/Test11_n3_MRPn5.RData")
+
+
+#n1
+EPICExt.n1_coef <- coefs_caret
+EPICExt.n1_out <- out
+EPICExt.n1_out$Ttest <- out
+EPICExt.n1_out$IDOL <- out
+EPICExt.n1_out$DHS <- out
+EPICExt.n1_out$IDOLext <- out
+save(EPICExt.n1_out, EPICExt.n1_coef, file = "CHILD_tests/Test11_n3_EPICExtn1.RData")
+#n2
+EPICExt.n2_coef <- coefs_caret
+EPICExt.n2_out <- out
+save(EPICExt.n2_out, EPICExt.n2_coef, file = "CHILD_tests/Test11_n3_EPICExtn2.RData")
+#n3
+EPICExt.n3_coef <- coefs_caret
+EPICExt.n3_out <- out
+save(EPICExt.n3_out, EPICExt.n3_coef, file = "CHILD_tests/Test11_n3_EPICExtn3.RData")
+#n4
+EPICExt.n4_coef <- coefs_caret
+EPICExt.n4_out <- out
+save(EPICExt.n4_out, EPICExt.n4_coef, file = "CHILD_tests/Test11_n3_EPICExtn4.RData")
+#n5
+EPICExt.n5_coef <- coefs_caret
+EPICExt.n5_out <- out
+save(EPICExt.n5_out, EPICExt.n5_coef, file = "CHILD_tests/Test11_n3_EPICExtn5.RData")
+```
+
+
+# For Karlie
+```{r}
+coef_CHILD_age1 <- coefs
+coef_CHILD_age5 <- coefs
+coef_CHILD_cord <- coefs
+save(coef_CHILD_age1, coef_CHILD_age5, coef_CHILD_cord, file = "/mnt/scratch/KoborLab/CHILD/CHILD_CTprediction_probes.RData")
+```
+
+
+
+
+### Peripheral Blood
+
+```{r}
+load("CHILD_tests/Test11_n3_EPICExtn1.RData")
+test <- EPICExt.n1_out
+
+### Compare to CBC
+CBC_1 <- read.csv("data/Complete_Blood_Count_One_Formatted.csv")
+CBC_1$ID <- paste0(CBC_1$SubjectNumber, "-1")
+CBC_5 <- read.csv("data/Complete_Blood_Count_Five_Formatted.csv")
+CBC_5$ID <- paste0(CBC_5$SubjectNumber, "-5")
+true <- rbind(CBC_1[, c("ID", "Prop_Lym", "Prop_Mono", "Prop_Eos", "Prop_Bas", "Prop_Neu")], 
+              CBC_5[, c("ID", "Prop_Lym", "Prop_Mono", "Prop_Eos", "Prop_Bas", "Prop_Neu")])
+true$Prop_Gran <- true$Prop_Neu + true$Prop_Bas + true$Prop_Eos
+rownames(true) <- true$ID
+true <- true[!rownames(true) %in% c("30386-1", "30219-1", "50379-1", "50115-1", "30830-5", "30784-5", "30379-5"), ] # Remove CBC outliers
+true <- true[, c("Prop_Lym", "Prop_Mono", "Prop_Gran")]
+colnames(true) <- c("Lym", "Mono", "Gran")
+
+# meta <- pData(CHILD_final)
+meta <- meta_5
+rownames(meta) <- meta$Sample_Name
+samp <- intersect(rownames(meta), rownames(true))
+meta <- meta[samp, ]
+true <- true[samp, ]
+identical(rownames(meta), rownames(true))
+rownames(true) <- paste0(meta$Chip_Position)
+
+Plotdiff <- function(x, y) {
+    diff <- x - y
+    diff <- reshape2::melt(diff)
+    return(diff)
+}
+
+diff <- lapply(1:length(test), function(x){
+    data <- test[[x]] 
+    if (ncol(data) %in% c(6, 7)) {
+        data <- data[, 1:6]
+        colnames(data) <- c("CD8T", "CD4T", "NK", "Bcell", "Mono", "Gran")
+        data$Lym <- data$CD8T + data$CD4T + data$Bcell + data$NK
+    } else {
+        data$Lym <- data$Bmem + data$Bnv + data$CD4mem + data$CD4nv + data$CD8mem + data$CD8nv + data$Treg + data$NK
+        data$Gran <- data$Bas + data$Neu + data$Eos
+    }
+    data <- data[rownames(true), c("Lym", "Mono", "Gran")]
+    out <- Plotdiff(data, true)
+    out$method <- names(test)[x]
+    return(out)
+})
+diff <- do.call(rbind, diff) %>% as.data.frame()
+diff$method <- factor(diff$method, levels = c("Ttest", "IDOL", "IDOLext", "DHS", "EL", "RF", "BLR", "CART", "GBM", "combined")) #, "RFEnNB", "RFEnSVM"
+
+diff <- diff[!diff$method %in% c("IDOL"), ]
+diff$method[diff$method == "IDOLext"] <- "IDOL"
+
+ggplot(diff, aes(value, variable, color = variable)) + 
+    geom_vline(xintercept = 0) + 
+    geom_boxplot() + 
+    geom_point() + 
+    facet_wrap(~method, ncol = 1) + 
+    labs(x = "Predicted - True", y = "Cell type") + 
+    theme_bw() + 
+    scale_colour_manual(values = c("Lym" = "#967D4B", "Mono" = "#647D64", "Gran" = "#7D96AF")) + 
+    scale_y_discrete(limits = rev)
+```
+
+### Plot correlation and rmse
+
+```{r}
+load("CHILD_tests/Test11_n3_EPICExtn1.RData")
+test <- EPICExt.n1_out
+
+cor <- lapply(1:length(test), function(x){
+    data <- test[[x]]
+    if (ncol(data) %in% c(6, 7)) {
+        data <- data[, 1:6]
+            colnames(data) <- c("CD8T", "CD4T", "Bcell", "NK", "Mono", "Gran")
+            data$Lym <- data$CD8T + data$CD4T + data$Bcell + data$NK
+        } else {
+            data$Lym <- data$Bmem + data$Bnv + data$CD4mem + data$CD4nv + data$CD8mem + data$CD8nv + data$Treg + data$NK
+            data$Gran <- data$Bas + data$Neu + data$Eos
+    }
+    data <- data[rownames(true), c("Lym", "Mono", "Gran")] 
+    out <- sapply(c("Lym", "Mono", "Gran"), function(ct){
+        pearson <- cor.test(true[, ct], data[, ct], method = "pearson")
+        spearman <- cor.test(true[, ct], data[, ct], method = "spearman")
+        samp <- !is.na(true[, ct])
+        rmse <- rmse(true[samp, ct], data[samp, ct])
+        return(c(pearson$estimate, spearman$estimate, rmse))
+    }) %>% as.data.frame()
+    rownames(out) <- c("pearson", "spearman", "rmse")
+    data.all <- c(data$Lym, data$Mono, data$Gran)
+    true.all <- c(true$Lym, true$Mono, true$Gran)
+    samp <- !is.na(true.all)
+    pearson <- cor.test(data.all[samp], true.all[samp], method = "pearson")
+    spearman <- cor.test(data.all[samp], true.all[samp], method = "spearman")
+    rmse <- rmse(data.all[samp], true.all[samp])
+    out$average <- c(pearson$estimate, spearman$estimate, rmse)
+    return(out)
+})
+names(cor) <- names(test)
+cor.out <- do.call(cbind, cor)
+write.csv(cor.out, file = "CHILD_tests/cor.out3.csv")
+
+hist(out.IDOLref.FN.5$Bcell)
+hist(true$Mono)
+
+# Multiple correlation plots
+allct <- lapply(1:length(test), function(x){
+    data <- test[[x]]
+    if (ncol(data) %in% c(6, 7)) {
+        data <- data[, 1:6]
+        colnames(data) <- c("CD8T", "CD4T", "Bcell", "NK", "Mono", "Gran")
+        data$Lym <- data$CD8T + data$CD4T + data$Bcell + data$NK
+    } else {
+        data$Lym <- data$Bmem + data$Bnv + data$CD4mem + data$CD4nv + data$CD8mem + data$CD8nv + data$Treg + data$NK
+        data$Gran <- data$Bas + data$Neu + data$Eos
+        }
+    data <- data[rownames(true), c("Lym", "Mono", "Gran")]
+    colnames(data) <- paste0(colnames(data), "_", names(test)[x])
+    return(data)
+}) %>% do.call(cbind, .) %>% as.data.frame()
+true.p <- true[, c("Lym", "Mono", "Gran")]
+colnames(true.p) <- paste0(colnames(true.p), "_CBC")
+allct <- cbind(allct, true.p)
+
+ggplot(allct, aes(Lym_CBC, Lym_FNtogether)) + geom_point() + geom_smooth(method = MASS::rlm, color = "gray") + theme_minimal()
+
+allct.p <- lapply(0:2, function(col){
+    cols <- 1:3 + col*3
+    data <- allct[, cols]
+    data$Sample <- rownames(data)
+    out <- reshape2::melt(data)
+    out$Celltype <- gsub("_.*", "", out$variable)
+    out$Method <- gsub(".*_", "", out$variable)
+    colnames(out)[3] <- unique(out$Method)
+    return(out[, c(1, 3, 4)])
+})
+plt2 <- do.call(cbind, allct.p)
+plt2 <- plt2[, c("Sample", "Celltype", "CBC", "noNorm", "FNtogether", "QN")] %>% as.data.frame()
+plt2 <- plt2[, c("Sample", "Celltype", "CBC", "IDOL", "IDOLextended", "MRP", "MRPextended", "MRPextended.limited")] %>% as.data.frame()
+plt2 <- plt2[, c("Sample", "Celltype", "CBC", "Ttest", "RF", "IDOL", "DHS", "Caret.EL", "Caret.RF", "Caret.BLR", "Caret.CART")] %>% as.data.frame()
+plt2 <- plt2[, c("Sample", "Celltype", "CBC", "CP", "SVR", "RPC")] %>% as.data.frame()
+plt2 <- plt2[, c("Sample", "Celltype", "CBC", "MRPref.QN.Caret.RF.RPC", "estimateCellCounts")] %>% as.data.frame()
+
+ggpairs(plt2, columns = 3:5,
+        mapping = ggplot2::aes(colour = Celltype),
+        axisLabels = "show",
+        upper = list(continuous = my_fn)) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.line = element_line(colour = "black")) + 
+    scale_colour_manual(values = c("Lym" = "#967D4B", "Mono" = "#647D64", "Gran" = "#7D96AF"))
+```
+
+#### Calculate p-value
+
+```{r}
+# Load necessary libraries
+library(multcomp)
+
+load("CHILD_tests/Test11_n3_MRPn3.RData")
+test <- EPICExt.n1_out
+
+cor.out <- lapply(list(MRP.n1_out, MRP.n2_out, MRP.n3_out, MRP.n4_out, MRP.n5_out), function(test){
+    cor <- lapply(1:length(test), function(x){
+        data <- test[[x]]
+        if (ncol(data) %in% c(6, 7)) {
+            data <- data[, 1:6]
+                colnames(data) <- c("CD8T", "CD4T", "Bcell", "NK", "Mono", "Gran")
+                data$Lym <- data$CD8T + data$CD4T + data$Bcell + data$NK
+            } else {
+                data$Lym <- data$Bmem + data$Bnv + data$CD4mem + data$CD4nv + data$CD8mem + data$CD8nv + data$Treg + data$NK
+                data$Gran <- data$Bas + data$Neu + data$Eos
+        }
+        data <- data[rownames(true), c("Lym", "Mono", "Gran")] 
+        out <- sapply(c("Lym", "Mono", "Gran"), function(ct){
+            pearson <- cor.test(true[, ct], data[, ct], method = "pearson")
+            spearman <- cor.test(true[, ct], data[, ct], method = "spearman")
+            samp <- !is.na(true[, ct])
+            rmse <- rmse(true[samp, ct], data[samp, ct])
+            return(c(pearson$estimate, spearman$estimate, rmse))
+        }) %>% as.data.frame()
+        rownames(out) <- c("pearson", "spearman", "rmse")
+        data.all <- c(data$Lym, data$Mono, data$Gran)
+        true.all <- c(true$Lym, true$Mono, true$Gran)
+        samp <- !is.na(true.all)
+        pearson <- cor.test(data.all[samp], true.all[samp], method = "pearson")
+        spearman <- cor.test(data.all[samp], true.all[samp], method = "spearman")
+        rmse <- rmse(data.all[samp], true.all[samp])
+        return(out)
+    })
+    names(cor) <- names(test)
+    cor.out <- do.call(cbind, cor)
+    return(cor.out)
+})
+
+MRP_rmse <- rbind(cor.out[[1]][3, c(1:15, 22:24)],
+                      cor.out[[2]][3, c(1:15, 22:24)], 
+                      cor.out[[3]][3, c(1:15, 22:24)], 
+                      cor.out[[4]][3, ], 
+                      cor.out[[5]][3, ]) %>%
+    reshape2::melt()
+MRP_rmse$method <- gsub("\\..*", "", MRP_rmse$variable) %>% as.factor()
+MRP_rmse$method <- factor(MRP_rmse$method, levels = c("EL", "RF", "BLR", "GBM", "CART", "combined"))
+MRP_rmse$ct <- gsub(".*\\.", "", MRP_rmse$variable) %>% as.factor()
+
+# Fit the ANCOVA model - method
+rmse.aov <- aov(value ~ method + ct, data = MRP_rmse)
+rmse.tukey <- TukeyHSD(rmse.aov, which = 'method')
+plot(rmse.tukey)
+
+rmse.mc <- glht(rmse.aov, linfct = mcp(method = 'Tukey'))
+summary(rmse.mc)
+
+ggboxplot(MRP_rmse, x = "method", y = "value", color = "method", palette = "npg", add = "jitter") + 
+    showSignificance(c(1, 2), 0.09, -0.001, "p = 1.000") + 
+    showSignificance(c(1, 3), 0.12, -0.001, "p = 0.926") + 
+    showSignificance(c(1, 4), 0.15, -0.001, "p = 0.922") + 
+    showSignificance(c(1, 5), 0.18, -0.001, "p = 0.948") +
+    showSignificance(c(1, 6), 0.33, -0.001, "***") +
+    stat_compare_means(method = "t.test", label.y = 0.35) + 
+    labs(x = "", y = "RMSE")
+    
+# Fit the ANCOVA model - reference
+
+MRP_rmse$reference <- "MRP"
+EPICExt_rmse$reference <- "IDOLExt"
+Ref_rmse <- rbind(MRP_rmse, EPICExt_rmse)
+Ref_rmse <- Ref_rmse[Ref_rmse$method != "combined", ]
+    
+rmse.aov <- lm(value ~ reference + method + ct, data = Ref_rmse)
+summary(rmse.aov)
+
+ggboxplot(Ref_rmse, x = "reference", y = "value", color = "method", palette = "npg", add = "jitter") + 
+    showSignificance(c(1, 2), 0.08, -0.001, "***") + 
+    labs(x = "", y = "RMSE")
+ggboxplot(Ref_rmse, x = "reference", y = "value", color = "reference", palette = "npg", add = "jitter") + 
+    showSignificance(c(1, 2), 0.08, -0.001, "***") + 
+    labs(x = "", y = "RMSE")
+```
+
+### Cord Blood
+
+```{r}
+test <- test9[c(1, 6)]
+
+CBC_0 <- read.csv("Complete_Blood_Count_Birth_Formatted.csv")
+CBC_0$ID <- paste0(CBC_0$SubjectNumber, "-C")
+true <- rbind(CBC_0[, c("ID", "LYM.Relative..", "Mono.Relative..", "EOS.Relative..", "BAS.Relative..", "Neu.Relative..", "NRBC.Relative..")])
+true$Prop_Gran <- (true$Neu.Relative.. + true$BAS.Relative.. + true$EOS.Relative..) / 100
+true$Prop_Lym <- true$LYM.Relative.. / 100
+true$Prop_Mono <- true$Mono.Relative.. / 100
+true$Prop_nRBC <- true$NRBC.Relative.. / 100
+rownames(true) <- true$ID
+true <- true[, c("Prop_Lym", "Prop_Mono", "Prop_Gran", "Prop_nRBC")]
+colnames(true) <- c("Lym", "Mono", "Gran", "nRBC")
+
+# meta <- pData(CHILD_final)
+meta <- meta_0
+rownames(meta) <- meta$Sample_Name
+samp <- intersect(rownames(meta), rownames(true))
+meta <- meta[samp, ]
+true <- true[samp, ]
+rownames(true) <- paste0(meta$Sentrix_ID, "_", meta$Sentrix_Position)
+
+Plotdiff <- function(x, y) {
+    diff <- x - y
+    diff <- reshape2::melt(diff)
+    return(diff)
+}
+
+diff <- lapply(1:length(test), function(x){
+    data <- test[[x]] 
+    if (ncol(data) %in% c(6, 7)) {
+        data <- data[, 1:7]
+        colnames(data) <- c("CD8T", "CD4T", "Bcell", "NK", "Mono", "Gran", "nRBC")
+        data$Lym <- data$CD8T + data$CD4T + data$Bcell + data$NK
+    } else {
+        data$Lym <- data$Bmem + data$Bnv + data$CD4mem + data$CD4nv + data$CD8mem + data$CD8nv + data$Treg + data$NK
+        data$Gran <- data$Bas + data$Neu + data$Eos
+    }
+    data <- data[rownames(true), c("Lym", "Mono", "Gran", "nRBC")]
+    out <- Plotdiff(data, true)
+    out$method <- names(test)[x]
+    return(out)
+})
+diff <- do.call(rbind, diff) %>% as.data.frame()
+
+diff <- diff %>%
+    mutate(across(method, factor, levels=c("estimateCellCountsCord", "MRPref.QN.Caret.RF.RPC", "MRPref.QN.Caret.EL.RPC", "MRPref.Noob.Caret.RF.RPC", "MRPref.FN.Caret.RF.RPC", "MRPref.NoN.Caret.RF.RPC")))
+    # mutate(across(method, factor, levels=c("Ttest", "RF", "IDOL", "DHS", "Caret.EL", "Caret.RF", "Caret.BLR", "Caret.CART")))
+
+ggplot(diff, aes(value, variable, color = variable)) + geom_vline(xintercept = 0) + geom_boxplot() + geom_point() + facet_wrap(~method, ncol = 1) + labs(x = "Predicted - True", y = "Cell type") + theme_bw() + scale_colour_manual(values = c("Lym" = "#967D4B", "Mono" = "#647D64", "Gran" = "#7D96AF", "nRBC" = "dark red"))
+
+
+cor <- lapply(1:length(test), function(x){
+    out <- sapply(c("Lym", "Mono", "Gran", "nRBC"), function(ct){
+        data <- test[[x]]
+        if (ncol(data) %in% c(6, 7)) {
+            data <- data[, 1:7]
+            colnames(data) <- c("CD8T", "CD4T", "Bcell", "NK", "Mono", "Gran", "nRBC")
+            data$Lym <- data$CD8T + data$CD4T + data$Bcell + data$NK
+        } else {
+            data$Lym <- data$Bmem + data$Bnv + data$CD4mem + data$CD4nv + data$CD8mem + data$CD8nv + data$Treg + data$NK
+            data$Gran <- data$Bas + data$Neu + data$Eos
+        }
+        data <- data[rownames(true), c("Lym", "Mono", "Gran", "nRBC")]
+        pearson <- cor.test(true[, ct], data[, ct], method = "pearson")
+        spearman <- cor.test(true[, ct], data[, ct], method = "spearman")
+        samp <- !is.na(true[, ct])
+        rmse <- rmse(true[samp, ct], data[samp, ct])
+        return(c(pearson$estimate, spearman$estimate, rmse))
+    }) %>% as.data.frame()
+    rownames(out) <- c("pearson", "spearman", "rmse")
+    out$sum <- rowSums(out)
+    out$average <- out$sum / 4
+    return(out)
+})
+names(cor) <- names(test)
+cor.out <- do.call(cbind, cor)
+write.csv(cor.out, file = "cor.out9.csv")
+
+hist(out.IDOLref.FN.5$Bcell)
+hist(true$Mono)
+
+# Multiple correlation plots
+allct <- lapply(1:length(test), function(x){
+    data <- test[[x]]
+    if (ncol(data) %in% c(6, 7)) {
+        data <- data[, 1:6]
+        colnames(data) <- c("CD8T", "CD4T", "Bcell", "NK", "Mono", "Gran")
+        data$Lym <- data$CD8T + data$CD4T + data$Bcell + data$NK
+    } else {
+        data$Lym <- data$Bmem + data$Bnv + data$CD4mem + data$CD4nv + data$CD8mem + data$CD8nv + data$Treg + data$NK
+        data$Gran <- data$Bas + data$Neu + data$Eos
+        }
+    data <- data[rownames(true), c("Lym", "Mono", "Gran")]
+    colnames(data) <- paste0(colnames(data), "_", names(test)[x])
+    return(data)
+}) %>% do.call(cbind, .) %>% as.data.frame()
+true.p <- true[, c("Lym", "Mono", "Gran")]
+colnames(true.p) <- paste0(colnames(true.p), "_CBC")
+allct <- cbind(allct, true.p)
+
+ggplot(allct, aes(Lym_CBC, Lym_FNtogether)) + geom_point() + geom_smooth(method = MASS::rlm, color = "gray") + theme_minimal()
+
+allct.p <- lapply(0:2, function(col){
+    cols <- 1:3 + col*3
+    data <- allct[, cols]
+    data$Sample <- rownames(data)
+    out <- reshape2::melt(data)
+    out$Celltype <- gsub("_.*", "", out$variable)
+    out$Method <- gsub(".*_", "", out$variable)
+    colnames(out)[3] <- unique(out$Method)
+    return(out[, c(1, 3, 4)])
+})
+plt2 <- do.call(cbind, allct.p)
+plt2 <- plt2[, c("Sample", "Celltype", "CBC", "noNorm", "FNtogether", "QN")] %>% as.data.frame()
+plt2 <- plt2[, c("Sample", "Celltype", "CBC", "IDOL", "IDOLextended", "MRP", "MRPextended", "MRPextended.limited")] %>% as.data.frame()
+plt2 <- plt2[, c("Sample", "Celltype", "CBC", "Ttest", "RF", "IDOL", "DHS", "Caret.EL", "Caret.RF", "Caret.BLR", "Caret.CART")] %>% as.data.frame()
+plt2 <- plt2[, c("Sample", "Celltype", "CBC", "CP", "SVR", "RPC")] %>% as.data.frame()
+plt2 <- plt2[, c("Sample", "Celltype", "CBC", "MRPref.QN.Caret.RF.RPC", "estimateCellCounts")] %>% as.data.frame()
+
+
+
+ggpairs(plt2, columns = 3:5,
+        mapping = ggplot2::aes(colour = Celltype),
+        axisLabels = "show",
+        upper = list(continuous = my_fn)) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.line = element_line(colour = "black")) + 
+    scale_colour_manual(values = c("Lym" = "#967D4B", "Mono" = "#647D64", "Gran" = "#7D96AF"))
+
+save(test, diff, plt2, file = "RData/405-Count_diff_MRPv2_GSE82084_1.RData")
+save(test, diff, plt2, file = "RData/405-Count_diff_MRPv2_GSE82084_3.RData")
+
+```
+
+
+### External Adult cohorts
+```{r}
+### GSE77797
+# out.Extended.QN.Ttest <- out
+# out.Extended.QN.IDOL <- out
+# out.Extended.QN.DHS <- out
+out.Extended.QN.Caret_EL <- out$EL
+out.Extended.QN.Caret_RF <- out$RF
+out.Extended.QN.Caret_BLR <- out$BLR
+out.Extended.QN.Caret_CART <- out$CART
+out.Extended.QN.Caret_GBM <- out$GBM
+
+# out.Extended.QN.Caret_RFEnRF <- out$RFEnRF
+# out.Extended.QN.Caret_RFEnNB <- out$RFEnNB
+out.extended <- estimateCellCounts2(GSE77797, compositeCellType = "BloodExtended", probeSelect = "auto",
+                                    referencePlatform = "IlluminaHumanMethylationEPIC",
+                                    referenceset = "FlowSorted.BloodExtended.EPIC",
+                                    cellTypes = c("Bas", "Bmem", "Bnv", "CD4mem", "CD4nv", "CD8mem",
+                                                  "CD8nv", "Eos", "Mono", "Neu", "NK", "Treg"))
+out.extended <- out.extended$prop %>% as.data.frame()
+out.idol <- estimateCellCounts2(GSE77797, 
+                                compositeCellType = "Blood", 
+                                probeSelect = "IDOL",
+                                referencePlatform = "IlluminaHumanMethylationEPIC")
+out.idol <- out.idol$prop %>% as.data.frame()
+colnames(out.idol) <- c("CD8T", "CD4T", "NK", "Bcell", "Mono", "Gran")
+
+test.GSE77797 <- list(EL = out.Extended.QN.Caret_EL,
+                      RF = out.Extended.QN.Caret_RF,
+                      BLR = out.Extended.QN.Caret_BLR,
+                      CART = out.Extended.QN.Caret_CART,
+                      GBM = out.Extended.QN.Caret_GBM,
+                      # RFEnNB = out.Extended.QN.Caret_RFEnNB,
+                      ECC2extended = out.extended,
+                      # RFEnSVM = out.Extended.QN.Caret_RFEnSVM,
+                      # Ttest = out.Extended.QN.Ttest,
+                      ECC2IDOL = out.idol
+                      # DHS = out.Extended.QN.DHS,
+                      )
+save(test.GSE77797, coefs_caret, file = "Validation_tests/Test_GSE77797_1.RData")
+save(test.GSE77797, coefs_caret, file = "Validation_tests/Test_GSE77797_2.RData")
+save(test.GSE77797, coefs_caret, file = "Validation_tests/Test_GSE77797_3.RData")
+
+### GSE112618
+# out.Extended.QN.Ttest <- out
+# out.Extended.QN.IDOL <- out
+# out.Extended.QN.DHS <- out
+out.Extended.QN.Caret_EL <- out$EL
+out.Extended.QN.Caret_RF <- out$RF
+out.Extended.QN.Caret_BLR <- out$BLR
+out.Extended.QN.Caret_CART <- out$CART
+out.Extended.QN.Caret_GBM <- out$GBM
+out.Extended.QN.Caret_Combined <- out$combined
+out.extended <- estimateCellCounts2(GSE112618, compositeCellType = "BloodExtended", probeSelect = "auto",
+                                    referencePlatform = "IlluminaHumanMethylationEPIC",
+                                    referenceset = "FlowSorted.BloodExtended.EPIC",
+                                    cellTypes = c("Bas", "Bmem", "Bnv", "CD4mem", "CD4nv", "CD8mem",
+                                                  "CD8nv", "Eos", "Mono", "Neu", "NK", "Treg"))
+out.extended <- out.extended$prop %>% as.data.frame()
+out.idol <- estimateCellCounts2(GSE112618, 
+                                compositeCellType = "Blood", 
+                                probeSelect = "IDOL",
+                                referencePlatform = "IlluminaHumanMethylationEPIC")
+out.idol <- out.idol$prop %>% as.data.frame()
+colnames(out.idol) <- c("CD8T", "CD4T", "NK", "Bcell", "Mono", "Gran")
+
+test.GSE112618 <- list(EL = out.Extended.QN.Caret_EL,
+                       RF = out.Extended.QN.Caret_RF,
+                       BLR = out.Extended.QN.Caret_BLR,
+                       CART = out.Extended.QN.Caret_CART,
+                       GBM = out.Extended.QN.Caret_GBM,
+                       Combined = out.Extended.QN.Caret_Combined,
+                       ECC2extended = out.extended, 
+                       ECC2IDOL = out.idol
+                       # RFEnSVM = out.Extended.QN.Caret_RFEnSVM,
+                       # Ttest = out.Extended.QN.Ttest,
+                       # 
+                       # DHS = out.Extended.QN.DHS,
+                       )
+save(test.GSE112618, coefs_caret, file = "Validation_tests/Test_GSE112618_1.RData")
+save(test.GSE112618, coefs_caret, file = "Validation_tests/Test_GSE112618_2.RData")
+save(test.GSE112618, coefs_caret, file = "Validation_tests/Test_GSE112618_3.RData")
+
+load("Validation_tests/Test_GSE112618.RData")
+test <- test.GSE112618
+load("Validation_tests/Test_GSE77797.RData")
+library(GEOquery)
+GSE77797 <- getGEO("GSE77797", destdir = "/mnt/scratch/KoborLab/Personal_Folders/mfu/Projects/MRP/data/")
+GSE77797.m <- GSE77797$GSE77797_series_matrix.txt.gz %>% pData(.)
+GSE77797.m <- GSE77797.m[GSE77797.m$source_name_ch1 != "Adult human whole blood", ]
+GSE77797.ct <- GSE77797.m[, 42:47] %>% as.data.frame()
+colnames(GSE77797.ct) <- c("Bcell", "CD4T", "CD8T", "Gran", "Mono", "NK")
+GSE77797.ct <- GSE77797.ct[, c("CD8T", "CD4T", "Bcell", "NK", "Mono", "Gran")]
+GSE77797.ct <- apply(GSE77797.ct, 2, function(x) as.numeric(x)/100) %>% as.data.frame()
+rownames(GSE77797.ct) <- rownames(GSE77797.m)
+test <- test.GSE77797
+identical(gsub("_.*", "", rownames(test[[1]])), rownames(GSE77797.ct))
+test <- lapply(test, function(x){
+    rownames(x) <- gsub("_.*", "", rownames(x))
+    return(x)
+})
+
+### Compare to CBC
+true <- GSE112618.ct
+true <- GSE77797.ct
+Plotdiff <- function(x, y) {
+    diff <- x - y
+    diff <- reshape2::melt(diff)
+    return(diff)
+}
+
+diff <- lapply(1:length(test), function(x){
+    data <- test[[x]] %>% as.data.frame()
+    if(ncol(data) > 7) {
+        data$Bcell <- data$Bmem + data$Bnv 
+        data$CD4T <- data$CD4mem + data$CD4nv + data$Treg
+        data$CD8T <- data$CD8mem + data$CD8nv
+        data$Gran <- data$Bas + data$Neu + data$Eos
+    }
+    data <- data[rownames(true), c("CD8T", "CD4T", "Bcell", "NK", "Mono", "Gran")]
+    out <- Plotdiff(data, true)
+    out$method <- names(test)[x]
+    return(out)
+})
+diff <- do.call(rbind, diff) %>% as.data.frame()
+diff$method <- factor(diff$method, levels = c("EL", "RF", "BLR", "CART", "GBM", "Combined", "ECC2extended", "ECC2IDOL"))
+
+ggplot(diff, aes(value, variable, color = variable)) + #diff[diff$method %in% c("EL", "RF", "BLR", "CART", "ECC2extended", "ECC2IDOL"), ]
+    geom_vline(xintercept = 0) + 
+    geom_boxplot() + 
+    geom_point() + 
+    facet_wrap(~method, ncol = 1) + 
+    labs(x = "Predicted - True", y = "Cell type") + 
+    theme_bw() + 
+    #scale_colour_manual(values = c("Lym" = "#967D4B", "Mono" = "#647D64", "Gran" = "#7D96AF")) + 
+    scale_y_discrete(limits = rev)
+    
+
+cor <- lapply(1:length(test), function(x){
+    data <- test[[x]]
+    if (ncol(data) %in% c(6, 7)) {
+        data <- data[, 1:6]
+        colnames(data) <- c("CD8T", "CD4T", "Bcell", "NK", "Mono", "Gran")
+    } else {
+        data$Bcell <- data$Bmem + data$Bnv 
+        data$CD4T <- data$CD4mem + data$CD4nv + data$Treg
+        data$CD8T <- data$CD8mem + data$CD8nv
+        data$Gran <- data$Bas + data$Neu + data$Eos
+    }
+    data <- data[rownames(true), c("CD8T", "CD4T", "Bcell", "NK", "Mono", "Gran")]
+    out <- sapply(c("CD8T", "CD4T", "Bcell", "NK", "Mono", "Gran"), function(ct){
+        pearson <- cor.test(true[, ct], data[, ct], method = "pearson")
+        spearman <- cor.test(true[, ct], data[, ct], method = "spearman")
+        samp <- !is.na(true[, ct])
+        rmse <- rmse(true[samp, ct], data[samp, ct])
+        return(c(pearson$estimate, spearman$estimate, rmse))
+    }) %>% as.data.frame()
+    rownames(out) <- c("pearson", "spearman", "rmse")
+    data.all <- c(data$CD8T, data$CD4T, data$Bcell, data$NK, data$Mono, data$Gran)
+    true.all <- c(true$CD8T, true$CD4T, true$Bcell, true$NK, true$Mono, true$Gran)
+    samp <- !is.na(true.all)
+    pearson <- cor.test(data.all[samp], true.all[samp], method = "pearson")
+    spearman <- cor.test(data.all[samp], true.all[samp], method = "spearman")
+    rmse <- rmse(data.all[samp], true.all[samp])
+    out$average <- c(pearson$estimate, spearman$estimate, rmse)
+    return(out)
+})
+names(cor) <- names(test)
+cor.out <- do.call(cbind, cor)
+write.csv(cor.out, file = "Validation_tests/cor.out_GSE112618.csv")
+write.csv(cor.out, file = "Validation_tests/cor.out_GSE77797.csv")
+
+hist(out.IDOLref.FN.5$Bcell)
+hist(true$Mono)
+
+# Multiple correlation plots
+allct <- lapply(1:length(test), function(x){
+    data <- test[[x]]
+    if (ncol(data) %in% c(6, 7)) {
+        data <- data[, 1:6]
+        colnames(data) <- c("CD8T", "CD4T", "Bcell", "NK", "Mono", "Gran")
+        data$Lym <- data$CD8T + data$CD4T + data$Bcell + data$NK
+    } else {
+        data$Lym <- data$Bmem + data$Bnv + data$CD4mem + data$CD4nv + data$CD8mem + data$CD8nv + data$Treg + data$NK
+        data$Gran <- data$Bas + data$Neu + data$Eos
+        }
+    data <- data[rownames(true), c("Lym", "Mono", "Gran")]
+    colnames(data) <- paste0(colnames(data), "_", names(test)[x])
+    return(data)
+}) %>% do.call(cbind, .) %>% as.data.frame()
+true.p <- true[, c("Lym", "Mono", "Gran")]
+colnames(true.p) <- paste0(colnames(true.p), "_CBC")
+allct <- cbind(allct, true.p)
+
+ggplot(allct, aes(Lym_CBC, Lym_FNtogether)) + geom_point() + geom_smooth(method = MASS::rlm, color = "gray") + theme_minimal()
+
+allct.p <- lapply(0:2, function(col){
+    cols <- 1:3 + col*3
+    data <- allct[, cols]
+    data$Sample <- rownames(data)
+    out <- reshape2::melt(data)
+    out$Celltype <- gsub("_.*", "", out$variable)
+    out$Method <- gsub(".*_", "", out$variable)
+    colnames(out)[3] <- unique(out$Method)
+    return(out[, c(1, 3, 4)])
+})
+plt2 <- do.call(cbind, allct.p)
+plt2 <- plt2[, c("Sample", "Celltype", "CBC", "noNorm", "FNtogether", "QN")] %>% as.data.frame()
+plt2 <- plt2[, c("Sample", "Celltype", "CBC", "IDOL", "IDOLextended", "MRP", "MRPextended", "MRPextended.limited")] %>% as.data.frame()
+plt2 <- plt2[, c("Sample", "Celltype", "CBC", "Ttest", "RF", "IDOL", "DHS", "Caret.EL", "Caret.RF", "Caret.BLR", "Caret.CART")] %>% as.data.frame()
+plt2 <- plt2[, c("Sample", "Celltype", "CBC", "CP", "SVR", "RPC")] %>% as.data.frame()
+plt2 <- plt2[, c("Sample", "Celltype", "CBC", "MRPref.QN.Caret.RF.RPC", "estimateCellCounts")] %>% as.data.frame()
+
+ggpairs(plt2, columns = 3:5,
+        mapping = ggplot2::aes(colour = Celltype),
+        axisLabels = "show",
+        upper = list(continuous = my_fn)) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.line = element_line(colour = "black")) + 
+    scale_colour_manual(values = c("Lym" = "#967D4B", "Mono" = "#647D64", "Gran" = "#7D96AF"))
+```
+
+### ASXL1
+```{r}
+load("~/Personal_Folders/mfu/Projects/ASXL1/RData/05-Outlier_filtered.RData")
+dataset <- betas(MLset.F)
+ASXL1.Extended.QN.Ttest <- out
+
+require(dplyr)
+require(ggpubr)
+require(gridExtra)
+varname <- "Disease_Status"
+
+pData(MLset.F) <- pData(MLset.F)[, 1:238] %>% 
+    cbind(., ASXL1.Extended.QN.Ttest)
+pltdat <- MLset.F[, pData(MLset.F)$Disease_Status %in% c("ASXL1 variant", "Healthy Control") & pData(MLset.F)$Cell_Type == "Whole Blood"]
+mt <- pData(pltdat)
+counts <- mt[, c("Sample_ID", c("Bas", "Bmem", "Bnv", "CD4mem", "CD4nv", "CD8mem", "CD8nv", "Eos", "Mono", "Neu", "NK", "Treg"))]
+counts_plot <- melt(counts)
+covar <- mt[, c("Sample_ID", varname)]
+plt <- merge(counts_plot, covar, by = "Sample_ID") %>%
+    na.omit(.)
+
+p1 <- ggplot(plt, aes(get(varname), value, fill = get(varname))) +
+    geom_boxplot(alpha = 0.2) +
+    geom_point(shape = 21, aes(group = Sample_ID),
+               position = position_jitter(w = 0.1)) +
+    xlab(NULL) +
+    ylab("Cell Proportion") +
+    theme_bw() +
+    theme(axis.text = element_text(size = 12, color = "black"),
+          axis.title = element_text(size = 14),
+          legend.text = element_text(size = 11),
+          legend.title = element_text(size = 14),
+          strip.text = element_text(size = 14)) +
+    facet_wrap(~ variable, ncol = 3)
+plot(p1)
+
+```
+
+
+```{r}
+load("CHILD_tests/Test12_ASXL1_Tcell.RData")
+
+test <- ASXL1_Tcell_ct
+true <- meta[, c("CD4_perc_flow", "CD8_perc_flow")] / 100
+colnames(true) <- c("CD4", "CD8")
+true <- true[grep("T1", rownames(true)), ]
+
+cor <- lapply(1:length(test), function(x){
+    data <- test[[x]]
+    data$CD8 <- data$CD8mem + data$CD8nv
+    data$CD4 <- data$CD4mem + data$CD4nv
+    data <- data[rownames(true), c("CD4", "CD8")] 
+    out <- sapply(c("CD4", "CD8"), function(ct){
+        pearson <- cor.test(true[, ct], data[, ct], method = "pearson")
+        spearman <- cor.test(true[, ct], data[, ct], method = "spearman")
+        samp <- !is.na(true[, ct])
+        rmse <- rmse(true[samp, ct], data[samp, ct])
+        return(c(pearson$estimate, spearman$estimate, rmse))
+    }) %>% as.data.frame()
+    rownames(out) <- c("pearson", "spearman", "rmse")
+    data.all <- c(data$CD4, data$CD8)
+    true.all <- c(true$CD4, true$CD8)
+    samp <- !is.na(true.all)
+    pearson <- cor.test(data.all[samp], true.all[samp], method = "pearson")
+    spearman <- cor.test(data.all[samp], true.all[samp], method = "spearman")
+    rmse <- rmse(data.all[samp], true.all[samp])
+    out$average <- c(pearson$estimate, spearman$estimate, rmse)
+    return(out)
+})
+names(cor) <- names(test)
+cor.out <- do.call(cbind, cor)
+
+predCT <- lapply(1:length(test), function(x){
+    data <- test[[x]]
+    data$CD8_DNAm <- data$CD8mem + data$CD8nv
+    data$CD4_DNAm <- data$CD4mem + data$CD4nv
+    data <- data[rownames(true), c("CD4_DNAm", "CD8_DNAm")]
+    data$CD4_flow <- true$CD4
+    data$CD8_flow <- true$CD8
+    return(data)
+})
+names(predCT) <- names(test)
+
+ggplot(predCT$Ttest, aes(CD8_flow, CD8_DNAm)) +
+    geom_smooth(method = "lm", color = "dark gray") + 
+    geom_point(size = 3) + 
+    theme_bw() + 
+    stat_cor(method = "pearson", label.x = 0.05, label.y = 0.7) + 
+    theme(text = element_text(size = 14)) 
+cor.test(meta$CD4_perc_flow, meta$CD4_perc_DNAm)
+cor.test(meta$CD8_perc_flow, meta$CD8_perc_DNAm)
+```
+
